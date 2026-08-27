@@ -121,56 +121,41 @@ ZONES = {
     "71": "71 (All 3 Lawns Combined ) ", "72": "72 (All Walkways/Streets ) "
 }
 
-def generate_purge ( ) :
-    try:
-        r_iss = combo_iss.get ( )
-        selected_text = combo_al.get ( )
-        r_al = selected_text.split ( " " ) [0]
-        
-        r_tm = entry_tm.get ( ) .strip ( ) .upper ( )
-        r_dt = entry_dt.get ( ) .strip ( )
-        
-        chks = sorted ( [int ( k) for k, v in zone_vars.items ( ) if v.get ( ) ])
-        
-        if not chks or not r_iss or not r_al or not r_tm or not r_dt:
-            return messagebox.showerror ( "Error", "Missing fields or no zones selected")
-        spans, start, prev = [], chks[0], chks[0]
-        for c in chks[1:]:
-            if c == prev + 1:
-                prev = c
-            else:
-                spans.append ( ( start, prev ) )
-                start = prev = c
-        spans.append ( ( start, prev ) )
-        
-        out = ""
-        for s, e in spans:
-            if s == e:
-                out += f"+{s:02d}"
-            else:
-                out += f"+{s:02d}/{e:02d}"
-            
-        output_text.delete ( "1.0", tk.END)
-        output_text.insert ( tk.END, f"OGZC-{r_iss}-{r_al}-{r_tm}-{r_dt}{out}")
-    except Exception as e:
-        messagebox.showerror ( "Error", str ( e ) )
 
-if __name__ == "__main__":
-    root = tk.Tk ( )
-    root.title ( "OAME Mini v4 - Oglethorpe Alert Message Encoding Encoder")
-    root.geometry ( "650x550")
-    f_top = ttk.LabelFrame ( root, text=" Telecommunications Protocol Configuration ", padding=5)
-    f_top.pack ( fill=tk.X, padx=10, pady=5)
+def build_oame_gui(container=None, fullscreen=False):
+    """Build the OAME GUI into `container` (a tk widget). If container is None, a new tk.Tk() is created and returned.
+    Returns a dict of key widgets.
+    """
+    own_root = False
+    if container is None:
+        root = tk.Tk()
+        own_root = True
+    else:
+        root = container
 
-    combo_iss = ttk.Combobox ( f_top, values=ORIGINATORS, width=7, state="readonly")
-    combo_iss.pack ( side=tk.LEFT, padx=5 ) ; combo_iss.set ( "EAS")
+    if own_root:
+        root.title("OAME Mini v4 - Oglethorpe Alert Message Encoding Encoder")
+        if fullscreen:
+            try:
+                root.attributes("-fullscreen", True)
+            except Exception:
+                root.geometry("650x550")
+        else:
+            root.geometry("650x550")
 
-    sorted_events = [EVENT_CODES[k] for k in sorted ( EVENT_CODES.keys ( ) ) ]
-    combo_al = ttk.Combobox ( f_top, values=sorted_events, width=38, state="readonly")
-    combo_al.pack ( side=tk.LEFT, padx=5 ) ; combo_al.set ( "INT (Internal Test)")
+    f_top = ttk.LabelFrame(root, text=" Telecommunications Protocol Configuration ", padding=5)
+    f_top.pack(fill=tk.X, padx=10, pady=5)
+
+    combo_iss = ttk.Combobox(f_top, values=ORIGINATORS, width=7, state="readonly")
+    combo_iss.pack(side=tk.LEFT, padx=5)
+    combo_iss.set("EAS")
+
+    sorted_events = [EVENT_CODES[k] for k in sorted(EVENT_CODES.keys())]
+    combo_al = ttk.Combobox(f_top, values=sorted_events, width=38, state="readonly")
+    combo_al.pack(side=tk.LEFT, padx=5)
+    combo_al.set("INT (Internal Test)")
 
     now = datetime.datetime.now()
-
     if now.hour == 23 and now.minute >= 46:
         target_date = now + datetime.timedelta(days=1)
     else:
@@ -191,34 +176,75 @@ if __name__ == "__main__":
     entry_dt = ttk.Entry(f_top, width=6)
     entry_dt.pack(side=tk.LEFT, padx=5)
     entry_dt.insert(0, formatted_dt)
-    # Scrollable Center Panel for Sector Targeting
-    f_middle = ttk.LabelFrame ( root, text=" Targeted Micronation Grid Sectors ", padding=5)
-    f_middle.pack ( fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-    canvas = tk.Canvas ( f_middle, borderwidth=0, highlightthickness=0)
-    scrollbar = ttk.Scrollbar ( f_middle, orient="vertical", command=canvas.yview)
-    scroll_frame = ttk.Frame ( canvas)
+    f_middle = ttk.LabelFrame(root, text=" Targeted Micronation Grid Sectors ", padding=5)
+    f_middle.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-    scroll_frame.bind ( "<Configure>", lambda e: canvas.configure ( scrollregion=canvas.bbox ( "all" ) ) )
-    canvas.create_window ( ( 0, 0 ) , window=scroll_frame, anchor="nw")
-    canvas.configure ( yscrollcommand=scrollbar.set)
+    canvas = tk.Canvas(f_middle, borderwidth=0, highlightthickness=0)
+    scrollbar = ttk.Scrollbar(f_middle, orient="vertical", command=canvas.yview)
+    scroll_frame = ttk.Frame(canvas)
 
-    canvas.pack ( side="left", fill="both", expand=True)
-    scrollbar.pack ( side="right", fill="y")
+    scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
 
-    # Renders the 52 distinct zones across the domestic map
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
     zone_vars = {}
-    sorted_keys = sorted ( ZONES.keys ( ) , key=lambda x: int ( x ) )
+    sorted_keys = sorted(ZONES.keys(), key=lambda x: int(x))
+    for idx, key in enumerate(sorted_keys):
+        zone_vars[key] = tk.BooleanVar()
+        r, c = idx // 2, idx % 2
+        cb = ttk.Checkbutton(scroll_frame, text=ZONES[key], variable=zone_vars[key])
+        cb.grid(row=r, column=c, sticky=tk.W, padx=10, pady=2)
 
-    for idx, key in enumerate ( sorted_keys ) :
-        zone_vars[key] = tk.BooleanVar ( )
-        r, c = idx // 2, idx % 2 # Double-column tactical arrangement
-        cb = ttk.Checkbutton ( scroll_frame, text=ZONES[key], variable=zone_vars[key])
-        cb.grid ( row=r, column=c, sticky=tk.W, padx=10, pady=2)
+    output_text = tk.Text(root, height=2, width=70, font=("Courier", 11, "bold"), fg="#00FF00", bg="#111111")
+    output_text.pack(padx=10, pady=10)
 
-    ttk.Button ( root, text= "GENERATE PACKET BURST", command=generate_purge ) .pack ( pady=5)
+    def generate_purge():
+        try:
+            r_iss = combo_iss.get()
+            selected_text = combo_al.get()
+            r_al = selected_text.split(" ")[0]
+            r_tm = entry_tm.get().strip().upper()
+            r_dt = entry_dt.get().strip()
+            chks = sorted([int(k) for k, v in zone_vars.items() if v.get()])
+            if not chks or not r_iss or not r_al or not r_tm or not r_dt:
+                return messagebox.showerror("Error", "Missing fields or no zones selected")
+            spans, start, prev = [], chks[0], chks[0]
+            for c in chks[1:]:
+                if c == prev + 1:
+                    prev = c
+                else:
+                    spans.append((start, prev))
+                    start = prev = c
+            spans.append((start, prev))
+            out = ""
+            for s, e in spans:
+                if s == e:
+                    out += f"+{s:02d}"
+                else:
+                    out += f"+{s:02d}/{e:02d}"
+            output_text.delete("1.0", tk.END)
+            output_text.insert(tk.END, f"OGZC-{r_iss}-{r_al}-{r_tm}-{r_dt}{out}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
 
-    output_text = tk.Text ( root, height=2, width=70, font= ( "Courier", 11, "bold" ) , fg="#00FF00", bg="#111111")
-    output_text.pack ( padx=10, pady=10)
+    ttk.Button(root, text="GENERATE PACKET BURST", command=generate_purge).pack(pady=5)
 
-    root.mainloop ( )
+    if own_root:
+        root.mainloop()
+
+    return {
+        'combo_iss': combo_iss,
+        'combo_al': combo_al,
+        'entry_tm': entry_tm,
+        'entry_dt': entry_dt,
+        'zone_vars': zone_vars,
+        'output_text': output_text,
+    }
+
+
+if __name__ == "__main__":
+    build_oame_gui(None, fullscreen=False)

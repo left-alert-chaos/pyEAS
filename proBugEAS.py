@@ -12,6 +12,8 @@ import sounddevice as sd
 import requests
 import SAME
 import OAME
+import shutil
+import re
 
 try:
     import tomllib
@@ -19,7 +21,7 @@ except ModuleNotFoundError:
     import tomli as tomllib
 
 # --- Constants ---
-SAMPLE_RATE = 80000       
+SAMPLE_RATE = 80000      
 BAUD_RATE = 520.8333        
 FREQ_MARK, FREQ_SPACE = 2083.33, 1562.50        
 PREAMBLE_BITS = 128         
@@ -54,7 +56,7 @@ DEFAULT_CONFIG = {
     "auto": {
         "event_codes": ["TOR", "SVR", "FFW", "FLW", "WSW", "SVS"],
         "callsign": "WXR",
-        "counties": ["042003", "000000", "042000"],
+        "counties": [],
         "weather_text": True,
         "alert_text_template": "HAZ...{hazard} HAIL {hail} SRC...{source}",
     },
@@ -183,6 +185,9 @@ def _current_auto_config():
 
 
 def _parse_alert_text(event_name, headline, description, template=None):
+    if description:
+        return description
+
     template = template or _current_auto_config().get("alert_text_template", DEFAULT_CONFIG["auto"]["alert_text_template"])
     text_blob = " ".join(part for part in [event_name, headline, description] if part)
     lower_text = text_blob.lower()
@@ -374,6 +379,15 @@ def read_and_resample_wav(filepath):
         data = np.interp(np.linspace(0, len(data) - 1, num_target_samples), np.arange(len(data)), data)
     return data.astype(np.int16)
 
+def cleanup_temp_tts_files():
+    base_dir = Path(__file__).resolve().parent
+    for temp_file in base_dir.glob("temp_live_tts_*.wav"):
+        try:
+            temp_file.unlink()
+        except Exception:
+            pass
+
+
 def run_tts(text):
     temp_tts = f"temp_live_tts_{threading.get_ident()}.wav"
     try:
@@ -395,24 +409,225 @@ def run_tts(text):
                 pass
         return np.array([], dtype=np.int16)
 
+
+# --- PulseAudio / PipeWire sink-input focus helpers ---
+TARGET_SINK_INPUT_ID = None
+_SAVED_SINK_MUTE_STATES = None
+
+def list_sink_inputs():
+    try:
+        proc = subprocess.run(["pactl", "list", "sink-inputs", "short"], capture_output=True, text=True, check=True)
+        lines = [L for L in proc.stdout.splitlines() if L.strip()]
+        out = []
+        for ln in lines:
+            parts = ln.split(None, 3)
+            if parts:
+                out.append({"id": parts[0], "rest": parts[1:]})
+        return out
+    except Exception:
+        return []
+
+
+def pactl_available():
+    return shutil.which("pactl") is not None
+
+def _read_sink_mute_states():
+    try:
+        proc = subprocess.run(["pactl", "list", "sink-inputs"], capture_output=True, text=True, check=True)
+        text = proc.stdout
+    except Exception:
+        return {}
+    states = {}
+    blocks = text.split("Sink Input #")
+    for blk in blocks[1:]:
+        lines = blk.splitlines()
+        first = lines[0].strip()
+        sid = first.split()[0]
+        mute = False
+        for L in lines:
+            if L.strip().startswith("Mute:"):
+                mute = L.strip().split(":", 1)[1].strip().lower() == "yes"
+                break
+        states[sid] = mute
+    return states
+
+def _set_sink_input_mute(sid, mute):
+    try:
+        subprocess.run(["pactl", "set-sink-input-mute", str(sid), "1" if mute else "0"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+def prepare_audio_focus(target_id=None):
+    global _SAVED_SINK_MUTE_STATES, TARGET_SINK_INPUT_ID
+    if target_id is None:
+        target_id = TARGET_SINK_INPUT_ID
+    if target_id is None:
+        return False
+    if not pactl_available():
+        try:
+            lbl_status.config(text="pactl not available; audio focus disabled")
+        except Exception:
+            pass
+        return False
+    states = _read_sink_mute_states()
+    if not states:
+        return False
+    # Save a copy of states
+    _SAVED_SINK_MUTE_STATES = dict(states)
+    # Mute others (avoid muting then unmuting target which can race)
+    for sid, was_muted in states.items():
+        try:
+            if str(sid) == str(target_id):
+                _set_sink_input_mute(sid, False)
+            else:
+                _set_sink_input_mute(sid, True)
+        except Exception:
+            continue
+    try:
+        lbl_status.config(text=f"Audio focus prepared (target {target_id})")
+    except Exception:
+        pass
+    return True
+
+def restore_audio_focus():
+    global _SAVED_SINK_MUTE_STATES
+    if not _SAVED_SINK_MUTE_STATES:
+        return False
+    if not pactl_available():
+        try:
+            root.after(0, lambda: lbl_status.config(text="pactl not available; cannot restore audio focus"))
+        except Exception:
+            pass
+        _SAVED_SINK_MUTE_STATES = None
+        return False
+    failed = []
+    # Attempt restoration with retries
+    for sid, was_muted in list(_SAVED_SINK_MUTE_STATES.items()):
+        ok = False
+        for attempt in range(3):
+            if _set_sink_input_mute(sid, was_muted):
+                ok = True
+                break
+            time.sleep(0.15)
+        if not ok:
+            failed.append(sid)
+
+    # If any failures, try to explicitly unmute the target sink-input as a last resort
+    try:
+        tgt = TARGET_SINK_INPUT_ID
+        if tgt is not None:
+            for attempt in range(3):
+                if _set_sink_input_mute(tgt, False):
+                    if tgt in failed:
+                        failed.remove(tgt)
+                    break
+                time.sleep(0.15)
+    except Exception:
+        pass
+
+    _SAVED_SINK_MUTE_STATES = None
+    try:
+        if failed:
+            root.after(0, lambda: lbl_status.config(text=f"Audio focus restore: failed for {len(failed)} sink(s)"))
+        else:
+            root.after(0, lambda: lbl_status.config(text="Audio focus restored"))
+    except Exception:
+        pass
+    return len(failed) == 0
+
+def select_alert_target_counties(enabled_counties, same_codes, ugc_codes):
+    raw_codes = [str(code).strip() for code in (same_codes or []) + (ugc_codes or []) if str(code).strip()]
+    unique_codes = list(dict.fromkeys(raw_codes))
+
+    if enabled_counties:
+        enabled = {str(code).strip() for code in enabled_counties if str(code).strip()}
+        filtered = [code for code in unique_codes if code in enabled or code == "000000"]
+        return filtered or unique_codes or ["000000"]
+
+    return unique_codes or ["000000"]
+
+
 class BroadcastSystem:
     def __init__(self):
-        self.loop_items = []  
-        self.eas_queue = queue.Queue()  
+        self.loop_items = []
+        self.eas_queue = queue.Queue()
         self.current_loop_idx = 0
         self.current_array = np.array([], dtype=np.int16)
         self.array_pointer = 0
         self.is_playing_eas = False
         self.lock = threading.Lock()
-        
-        self.stream = sd.OutputStream(
-            samplerate=SAMPLE_RATE, 
-            channels=1, 
-            dtype='int16', 
-            blocksize=CHUNKS_PER_BUFFER,
-            callback=self._audio_callback
-        )
-        self.stream.start()
+        self.audio_enabled = False
+        self.stream = None
+        self._playback_thread = None
+
+        try:
+            self.stream = sd.OutputStream(
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype='int16',
+                blocksize=CHUNKS_PER_BUFFER,
+            )
+            self.stream.start()
+            self.audio_enabled = True
+            self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
+            self._playback_thread.start()
+        except Exception:
+            self.stream = None
+            self.audio_enabled = False
+
+    def _playback_loop(self):
+        while self.audio_enabled and self.stream is not None:
+            with self.lock:
+                if self.current_array.size == 0:
+                    out_chunk = np.zeros(CHUNKS_PER_BUFFER, dtype=np.int16)
+                else:
+                    remaining_samples = len(self.current_array) - self.array_pointer
+                    if remaining_samples <= 0:
+                        if self.is_playing_eas:
+                            self.is_playing_eas = False
+                            self.current_loop_idx = 0
+                            if self.loop_items:
+                                self.current_array = self.loop_items[self.current_loop_idx]
+                            else:
+                                self.current_array = np.array([], dtype=np.int16)
+                            self.array_pointer = 0
+                            try:
+                                threading.Thread(target=restore_audio_focus, daemon=True).start()
+                            except Exception:
+                                pass
+                        else:
+                            if self.loop_items:
+                                self.current_loop_idx = (self.current_loop_idx + 1) % len(self.loop_items)
+                                self.current_array = self.loop_items[self.current_loop_idx]
+                            else:
+                                self.current_array = np.zeros(SAMPLE_RATE, dtype=np.int16)
+                            self.array_pointer = 0
+
+                        if len(self.current_array) == 0:
+                            self.current_array = np.zeros(SAMPLE_RATE, dtype=np.int16)
+                            self.array_pointer = 0
+
+                        remaining_samples = len(self.current_array) - self.array_pointer
+
+                    take_samples = min(CHUNKS_PER_BUFFER, remaining_samples)
+                    if take_samples <= 0:
+                        out_chunk = np.zeros(CHUNKS_PER_BUFFER, dtype=np.int16)
+                    else:
+                        out_chunk = self.current_array[self.array_pointer:self.array_pointer + take_samples].copy()
+                        self.array_pointer += take_samples
+
+                if out_chunk.size == 0:
+                    out_chunk = np.zeros(CHUNKS_PER_BUFFER, dtype=np.int16)
+
+            try:
+                self.stream.write(out_chunk)
+            except Exception:
+                self.audio_enabled = False
+                self.stream = None
+                break
+
+            time.sleep(0.01)
 
     def update_loop(self, chunk_list):
         with self.lock:
@@ -428,12 +643,20 @@ class BroadcastSystem:
 
     def trigger_eas_interrupt(self, eas_audio_payload):
         with self.lock:
+            try:
+                prepare_audio_focus()
+            except Exception:
+                pass
             self.is_playing_eas = True
             self.current_array = eas_audio_payload
             self.array_pointer = 0
 
     def _audio_callback(self, outdata, frames, time_info, status):
         with self.lock:
+            if not self.audio_enabled or self.stream is None:
+                outdata[:] = np.zeros((frames, 1), dtype=np.int16)
+                return
+
             bytes_needed = frames
             out_buffer = np.zeros(bytes_needed, dtype=np.int16)
             write_idx = 0
@@ -451,11 +674,14 @@ class BroadcastSystem:
                         self.is_playing_eas = False
                         self.current_loop_idx = 0
                         if self.loop_items:
-                            # Resume from the first item in the loop rotation
                             self.current_array = self.loop_items[self.current_loop_idx]
                         else:
                             self.current_array = np.array([], dtype=np.int16)
                         self.array_pointer = 0
+                        try:
+                            threading.Thread(target=restore_audio_focus, daemon=True).start()
+                        except Exception:
+                            pass
                     else:
                         if self.loop_items:
                             self.current_loop_idx = (self.current_loop_idx + 1) % len(self.loop_items)
@@ -463,7 +689,7 @@ class BroadcastSystem:
                         else:
                             self.current_array = np.zeros(SAMPLE_RATE, dtype=np.int16)
                         self.array_pointer = 0
-                    
+
                     if len(self.current_array) == 0:
                         self.current_array = np.zeros(SAMPLE_RATE, dtype=np.int16)
                         self.array_pointer = 0
@@ -605,22 +831,22 @@ def deploy_eas_priority():
             if not r_head and use_siren and siren_placement == "attached":
                 eas_chunks.append(siren_audio)
                 eas_chunks.append(silence_1s)
-            elif r_head and siren_placement == "attached":
+            if r_head and siren_placement == "attached":
                 if potato_mode:
                     potato_audio = generate_afsk_chunk(text_to_bits("potato", include_siren=False, siren_gothroughs=0, siren_length=0, siren_only=False))
-                    h_audio = generate_afsk_chunk(text_to_bits(r_head + "-", False, 0, 0, siren_only=False))
+                    h_audio = generate_afsk_chunk(text_to_bits(r_head, False, 0, 0, siren_only=False))
                     for _ in range(3):
                         eas_chunks.append(potato_audio)
                         eas_chunks.append(silence_1s)
                         eas_chunks.append(h_audio)
                         eas_chunks.append(silence_1s)
                 else:
-                    h_audio = generate_afsk_chunk(text_to_bits(r_head + "-", use_siren, t_goa, t_slen, siren_only=False))
+                    h_audio = generate_afsk_chunk(text_to_bits(r_head, use_siren, t_goa, t_slen, siren_only=False))
                     for _ in range(3):
                         eas_chunks.append(h_audio)
                         eas_chunks.append(silence_1s)
             elif r_head:
-                h_audio = generate_afsk_chunk(text_to_bits(r_head + "-", False, 0, 0, siren_only=False))
+                h_audio = generate_afsk_chunk(text_to_bits(r_head, False, 0, 0, siren_only=False))
                 for _ in range(3):
                     eas_chunks.append(h_audio)
                     eas_chunks.append(silence_1s)
@@ -663,6 +889,23 @@ def deploy_eas_priority():
                     eas_chunks.append(f_audio)
                     eas_chunks.append(silence_1s)
 
+            # Append encoder SAME header (synthesized SAME header only) after EOM tones
+            try:
+                # Only append the alert-style encoder text when the voice/body starts with HAZ (severe thunderstorm summary)
+                body_text = (r_body or "").strip()
+                if body_text and body_text.upper().startswith("HAZ"):
+                    # craft a ZCZC-like header where the event field contains the HAZ... text and other params are blank
+                    enc_event_text = body_text.replace("\n", " ").strip()
+                    enc_origin = "   "
+                    encoder_header = f"ZCZC-{enc_origin}-{enc_event_text}-000000+0000-0000-{enc_origin.ljust(8, 'X')}-"
+                    enc_bits = text_to_bits(encoder_header, include_siren=False, siren_gothroughs=0, siren_length=0, siren_only=False)
+                    enc_audio = generate_afsk_chunk(enc_bits)
+                    for _ in range(3):
+                        eas_chunks.append(enc_audio)
+                        eas_chunks.append(silence_1s)
+            except Exception:
+                pass
+
             if eas_chunks:
                 full_eas_audio = np.concatenate(eas_chunks)
                 system_engine.trigger_eas_interrupt(full_eas_audio)
@@ -674,17 +917,38 @@ def deploy_eas_priority():
     threading.Thread(target=worker, daemon=True).start()
 
 def start_alert_monitor():
+    cleanup_temp_tts_files()
     processed_alerts = set()
+    startup_time = time.time()
+
+    def alert_is_new_enough(properties):
+        timestamp = None
+        for key in ("sent", "effective", "onset", "updated"):
+            value = properties.get(key)
+            if value:
+                timestamp = value
+                break
+        if not timestamp:
+            return True
+        try:
+            if timestamp.endswith("Z"):
+                timestamp = timestamp[:-1] + "+00:00"
+            dt = __import__("datetime").datetime.fromisoformat(timestamp)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=__import__("datetime").timezone.utc)
+            return (time.time() - dt.timestamp()) <= 60
+        except Exception:
+            return True
 
     def monitor_loop():
         headers = {'User-Agent': 'ProBugEASMonitor/2.0 (contact: test@example.com)'}
-        url = "https://api.weather.gov/alerts/active?area=PA"
+        url = "https://api.weather.gov/alerts/active?status=actual&message_type=alert"
 
         while True:
             try:
                 cfg = load_config(CONFIG_PATH).get("auto", DEFAULT_CONFIG["auto"])
                 auto_codes = {str(code).strip().upper() for code in cfg.get("event_codes", [])}
-                enabled_counties = {str(c).strip() for c in cfg.get("counties", [])}
+                enabled_counties = [str(c).strip() for c in cfg.get("counties", []) if str(c).strip()]
                 callsign = str(cfg.get("callsign", "WXR")).strip().upper() or "WXR"
                 include_weather_text = bool(cfg.get("weather_text", False))
                 alert_template = cfg.get("alert_text_template", DEFAULT_CONFIG["auto"]["alert_text_template"])
@@ -701,6 +965,9 @@ def start_alert_monitor():
                         if alert_id in processed_alerts:
                             continue
 
+                        if not alert_is_new_enough(properties):
+                            continue
+
                         geocode = properties.get("geocode", {})
                         same_codes = geocode.get("SAME", [])
                         ugc_codes = properties.get("UGC", [])
@@ -712,7 +979,7 @@ def start_alert_monitor():
 
                         matched_counties = []
                         for zone in same_codes + ugc_codes:
-                            if zone in enabled_counties or zone == "042003" or zone == "000000" or zone == "042000":
+                            if not enabled_counties or zone in enabled_counties or zone == "000000":
                                 matched_counties.append(zone)
 
                         if enabled_counties and not matched_counties:
@@ -723,36 +990,56 @@ def start_alert_monitor():
                         headline = properties.get("headline", "")
                         description = properties.get("description", "No details provided.")
 
-                        target_counties = matched_counties or (['042003'] if '042003' in enabled_counties else ['000000'] if '000000' in enabled_counties else ['042000'] if '042000' in enabled_counties else ['042003'])
+                        target_counties = select_alert_target_counties(enabled_counties, same_codes, ugc_codes)
 
+                        header_valid = False
                         try:
                             generated_header = SAME.encode_same_string(
                                 event_code=event_code,
                                 target_counties=target_counties,
                                 duration_hhmm="0100",
-                                originator=callsign[:3],
+                                originator="NWS"[:3],
                                 station_id=callsign[:8].ljust(8, 'X')
                             )
+                            header_valid = True
                         except Exception:
+                            # fallback header created but not considered valid for autobroadcast
                             generated_header = f"ZCZC-{callsign[:3]}-{event_code}-{target_counties[0]}+0100-{time.strftime('%j%H%M', time.gmtime())}-{callsign[:8].ljust(8, 'X')}-"
 
                         if include_weather_text:
                             generated_body = _parse_alert_text(event_name, headline, description, alert_template)
                         else:
                             generated_body = f"The National Weather Service has issued a {event_name}. {headline}. {description}"
+
+                        # Prepare text to populate the TTS box: strip the leading HAZ... HAIL... SRC... segment
+                        tts_body = generated_body
+                        try:
+                            if generated_body and generated_body.upper().startswith("HAZ"):
+                                m = re.search(r"SRC\.\.\.\s*\S+", generated_body, flags=re.IGNORECASE)
+                                if m:
+                                    tts_body = generated_body[m.end():].strip()
+                                else:
+                                    # If pattern not found, remove up to first sentence terminator
+                                    parts = re.split(r"[\.\n]", generated_body, maxsplit=1)
+                                    tts_body = parts[1].strip() if len(parts) > 1 else ""
+                        except Exception:
+                            tts_body = generated_body
                         generated_footer = "NNNN"
 
                         def update_gui_and_click():
                             entry_header.delete(0, tk.END)
                             entry_header.insert(0, generated_header)
 
+                            # Use the raw generated NWS text for TTS (do not compose or modify)
                             text_body.delete("1.0", tk.END)
                             text_body.insert("1.0", generated_body)
 
                             entry_footer.delete(0, tk.END)
                             entry_footer.insert(0, generated_footer)
 
-                            btn_eas.invoke()
+                            # Only autoplay if we successfully generated a valid SAME header
+                            if header_valid:
+                                btn_eas.invoke()
 
                         root.after(0, update_gui_and_click)
 
@@ -777,20 +1064,66 @@ def open_same_gui():
 
 
 def open_oame_gui():
-    subprocess.Popen(["python3", os.path.join(os.path.dirname(__file__), "OAME.py")], cwd=os.path.dirname(__file__))
+    try:
+        # open as a fullscreen Toplevel using the OAME builder if available
+        try:
+            import OAME as OAME_mod
+            top = tk.Toplevel(root)
+            try:
+                top.attributes("-fullscreen", True)
+            except Exception:
+                top.geometry("900x700")
+            OAME_mod.build_oame_gui(top, fullscreen=True)
+            return
+        except Exception:
+            pass
+        # fallback: spawn standalone script
+        subprocess.Popen(["python3", os.path.join(os.path.dirname(__file__), "OAME.py")], cwd=os.path.dirname(__file__))
+    except Exception:
+        messagebox.showerror("Error", "Unable to open OAME GUI")
 
 
 root = tk.Tk()
 root.title("BUG Weatherbot Studio + OAME/SAME Functionality v2")
-root.geometry("1200x900")
+root.geometry("1840x1020")
 root.minsize(1000, 700)
 root.resizable(True, True)
 
 notebook = ttk.Notebook(root)
 notebook.pack(fill=tk.BOTH, expand=True)
 
-main_frame = ttk.Frame(notebook, padding="15")
-notebook.add(main_frame, text="EAS Broadcast")
+# Create a scrollable container for the EAS Broadcast tab
+scroll_container = ttk.Frame(notebook)
+notebook.add(scroll_container, text="EAS Broadcast")
+
+vcanvas = tk.Canvas(scroll_container)
+vscroll = ttk.Scrollbar(scroll_container, orient="vertical", command=vcanvas.yview)
+vcanvas.configure(yscrollcommand=vscroll.set)
+vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+vcanvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+main_frame = ttk.Frame(vcanvas, padding="15")
+vcanvas.create_window((0,0), window=main_frame, anchor="nw")
+
+def _on_mainframe_config(event):
+    vcanvas.configure(scrollregion=vcanvas.bbox("all"))
+
+main_frame.bind("<Configure>", _on_mainframe_config)
+
+def _on_mousewheel(event):
+    if getattr(event, 'delta', 0) != 0:
+        # Windows / macOS
+        vcanvas.yview_scroll(int(-1*(event.delta/120)), 'units')
+    else:
+        # X11 (Linux) uses Button-4/5
+        if event.num == 4:
+            vcanvas.yview_scroll(-1, 'units')
+        elif event.num == 5:
+            vcanvas.yview_scroll(1, 'units')
+
+vcanvas.bind_all("<MouseWheel>", _on_mousewheel)
+vcanvas.bind_all("<Button-4>", _on_mousewheel)
+vcanvas.bind_all("<Button-5>", _on_mousewheel)
 
 settings_frame = ttk.Frame(main_frame, padding=(0, 8, 0, 0))
 settings_frame.pack(fill=tk.X)
@@ -916,18 +1249,22 @@ def save_auto_cfg_tab():
 
 ttk.Button(auto_tab, text="Save Auto Config", command=save_auto_cfg_tab).pack(fill=tk.X, pady=(12, 0))
 
-# OAME tab content
-same_launch_btn = ttk.Button(oame_tab, text="Open OAME standalone generator", command=open_oame_gui)
-same_launch_btn.pack(anchor=tk.W, pady=(0, 10))
-oame_info = tk.Label(
-    oame_tab,
-    text="The OAME generator lives in its own script but is now reachable from the main tabbed window.",
-    justify=tk.LEFT,
-    wraplength=700,
-    padx=8,
-    pady=8
-)
-oame_info.pack(anchor=tk.W, fill=tk.X)
+# OAME tab content: try to embed the OAME GUI, fallback to standalone launcher
+try:
+    import OAME as OAME_mod
+    OAME_mod.build_oame_gui(oame_tab, fullscreen=False)
+except Exception:
+    same_launch_btn = ttk.Button(oame_tab, text="Open OAME standalone generator", command=open_oame_gui)
+    same_launch_btn.pack(anchor=tk.W, pady=(0, 10))
+    oame_info = tk.Label(
+        oame_tab,
+        text="The OAME generator lives in its own script but is now reachable from the main tabbed window.",
+        justify=tk.LEFT,
+        wraplength=700,
+        padx=8,
+        pady=8
+    )
+    oame_info.pack(anchor=tk.W, fill=tk.X)
 
 launcher_frame = ttk.Frame(main_frame)
 launcher_frame.pack(fill=tk.X, pady=(0, 10))
@@ -945,6 +1282,51 @@ lbl_status = tk.Label(
     pady=5
 )
 lbl_status.pack(fill=tk.X, pady=5)
+
+# --- Audio focus GUI ---
+audio_focus_frame = ttk.LabelFrame(main_frame, text="Audio Focus (PulseAudio/PipeWire)")
+audio_focus_frame.pack(fill=tk.X, pady=(8, 10))
+
+audio_sink_var = tk.StringVar()
+audio_sink_combo = ttk.Combobox(audio_focus_frame, textvariable=audio_sink_var, values=[], width=80, state="readonly")
+audio_sink_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 4), pady=6)
+
+def refresh_sink_list():
+    sinks = list_sink_inputs()
+    display = []
+    for s in sinks:
+        rest = " ".join(s.get("rest", []))
+        display.append(f"{s.get('id')} - {rest}")
+    audio_sink_combo.config(values=display)
+    if display:
+        audio_sink_var.set(display[0])
+    else:
+        audio_sink_var.set("")
+        messagebox.showinfo("Audio Focus", "No sink-inputs found or pactl unavailable.")
+
+def set_target_sink_from_ui():
+    global TARGET_SINK_INPUT_ID
+    val = audio_sink_var.get()
+    if not val:
+        messagebox.showwarning("Audio Focus", "No sink selected")
+        return
+    sid = val.split(" - ", 1)[0].strip()
+    TARGET_SINK_INPUT_ID = sid
+    lbl_status.config(text=f"Audio focus target set to sink-input {sid}")
+
+def test_focus_cycle():
+    val = audio_sink_var.get()
+    if not val:
+        messagebox.showwarning("Audio Focus", "No sink selected to test")
+        return
+    sid = val.split(" - ", 1)[0].strip()
+    threading.Thread(target=lambda: (prepare_audio_focus(sid), time.sleep(2), restore_audio_focus()), daemon=True).start()
+
+ttk.Button(audio_focus_frame, text="Refresh", command=refresh_sink_list).pack(side=tk.LEFT, padx=4, pady=6)
+ttk.Button(audio_focus_frame, text="Set Target", command=set_target_sink_from_ui).pack(side=tk.LEFT, padx=4, pady=6)
+ttk.Button(audio_focus_frame, text="Test Focus", command=test_focus_cycle).pack(side=tk.LEFT, padx=4, pady=6)
+
+refresh_sink_list()
 
 ttk.Label(main_frame, text="1. EAS Header Code String:").pack(anchor=tk.W, pady=2)
 entry_header = ttk.Entry(main_frame, width=55, font=("Courier", 10))
